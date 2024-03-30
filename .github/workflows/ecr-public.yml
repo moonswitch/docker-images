@@ -81,7 +81,7 @@
             uses: docker/build-push-action@v5
             id: docker-build
             with:
-              context: .
+              context: ./${{ matrix.image }}
               platforms: linux/${{ matrix.arch }}
               labels: ${{ steps.meta.outputs.labels }}
               cache-from: type=local,src=/tmp/.buildx-cache
