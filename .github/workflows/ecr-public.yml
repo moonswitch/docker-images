@@ -1,0 +1,168 @@
+---
+    name: public.ecr.aws
+    
+    permissions:
+      id-token: write
+    
+    on:
+      push:
+        branches:
+          - main
+
+    env:
+      CONTAINER_REGISTRY: public.ecr.aws
+      IMAGE_TAG: ${{ github.sha }}
+      IMAGE_DEFAULT_TAG: latest
+    
+    jobs:
+      changed-images:
+        name: "Detect changes"
+        runs-on: ubuntu-latest
+        outputs:
+          matrix: ${{ steps.changed-files.outputs.all_changed_files }}
+        steps:
+          - uses: actions/checkout@v3
+            with:
+              fetch-depth: 0
+    
+          - name: Get changed files
+            id: changed-files
+            uses: tj-actions/changed-files@v44
+            with:
+              dir_names: true
+              dir_names_max_depth: 1
+              matrix: true
+      build:
+        name: Build image
+        needs: changed-images
+        strategy:
+          matrix:
+            image: ${{ fromJSON(needs.changed-images.outputs.matrix) }}
+            arch: [amd64, arm64]
+            include:
+              - builder: buildjet-2vcpu-ubuntu-2204
+                arch: amd64
+              - builder: buildjet-2vcpu-ubuntu-2204-arm
+                arch: arm64
+        runs-on: ${{ matrix.builder }}
+        permissions:
+          contents: read
+          packages: write
+        env:
+          CONTAINER_REPOSITORY: moonswitch/${{ matrix.image }}
+        steps:
+          - name: Checkout
+            uses: actions/checkout@v4
+    
+          - name: Set up Docker Buildx
+            uses: docker/setup-buildx-action@v3
+    
+          - name: Extract metadata (tags, labels) for Docker
+            id: meta
+            uses: docker/metadata-action@v5
+            env:
+              DOCKER_METADATA_PR_HEAD_SHA: true
+            with:
+              images: ${{ env.CONTAINER_REGISTRY }}/${{ env.CONTAINER_REPOSITORY }}
+              flavor: |
+                latest=false
+              tags: |
+                type=sha,format=long
+    
+          - name: Cache Docker layers
+            uses: buildjet/cache@v3
+            with:
+              path: /tmp/.buildx-cache
+              key: ${{ runner.os }}-${{ matrix.image }}-${{ matrix.arch }}-buildx-${{ github.sha }}
+              restore-keys: |
+                ${{ runner.os }}-${{ matrix.image }}-${{ matrix.arch }}-buildx-
+    
+          - name: Build image
+            uses: docker/build-push-action@v5
+            id: docker-build
+            with:
+              context: .
+              platforms: linux/${{ matrix.arch }}
+              labels: ${{ steps.meta.outputs.labels }}
+              cache-from: type=local,src=/tmp/.buildx-cache
+              cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+              outputs: type=image,name=${{ env.CONTAINER_REGISTRY }}/${{ env.CONTAINER_REPOSITORY }},push-by-digest=true,name-canonical=true,push=true
+          
+          - name: Export digest
+            run: |
+              mkdir -p /tmp/digests
+              digest="${{ steps.docker-build.outputs.digest }}"
+              touch "/tmp/digests/${digest#sha256:}"
+    
+          - name: Upload digest
+            uses: actions/upload-artifact@v4
+            with:
+              name: digests-${{ matrix.image }}-${{ matrix.arch }}
+              path: /tmp/digests
+              if-no-files-found: error
+              retention-days: 1
+          
+          - # Temp fix
+            # https://github.com/docker/build-push-action/issues/252
+            # https://github.com/moby/buildkit/issues/1896
+            name: Move cache
+            run: |
+              rm -rf /tmp/.buildx-cache
+              mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+      
+      push:
+        name: Build and push multi-arch image manifest
+        strategy:
+          matrix:
+            image: ${{ fromJSON(needs.changed-images.outputs.matrix) }}
+        runs-on: ubuntu-latest
+        needs:
+          - changed-images
+          - build
+        permissions:
+          contents: read
+        env:
+          CONTAINER_REPOSITORY: moonswitch/${{ matrix.image }}
+        steps:
+          - name: Download digests
+            uses: actions/download-artifact@v4
+            with:
+              path: /tmp/digests
+              pattern: digests-${{ matrix.image }}-*
+              merge-multiple: true
+          
+          - name: Set up Docker Buildx
+            uses: docker/setup-buildx-action@v3
+
+          - name: Configure AWS credentials
+            uses: aws-actions/configure-aws-credentials@v4
+            with:
+              aws-region: ${{ secrets.AWS_REGION }}
+              role-to-assume: ${{ secrets.AWS_IAM_ROLE_ARN }}
+          
+          - name: Login to Public ECR
+            uses: docker/login-action@v3
+            with:
+              registry: ${{ env.CONTAINER_REGISTRY }}
+    
+          - name: Extract metadata (tags, labels) for Docker
+            id: meta
+            uses: docker/metadata-action@v5
+            env:
+              DOCKER_METADATA_PR_HEAD_SHA: true
+            with:
+              images: ${{ env.CONTAINER_REGISTRY }}/${{ env.CONTAINER_REPOSITORY }}
+              flavor: |
+                latest=true
+              tags: |
+                type=sha,format=long
+    
+          - name: Create manifest list and push
+            working-directory: /tmp/digests
+            run: |
+              docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+                $(printf '${{ env.CONTAINER_REGISTRY }}/${{ env.CONTAINER_REPOSITORY }}@sha256:%s ' *)
+    
+          - name: Inspect image
+            run: |
+              docker buildx imagetools inspect ${{ env.CONTAINER_REGISTRY }}/${{ env.CONTAINER_REPOSITORY }}:${{ steps.meta.outputs.version }}
