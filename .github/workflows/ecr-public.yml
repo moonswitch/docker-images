@@ -8,6 +8,8 @@
       push:
         branches:
           - main
+        paths-ignore:
+          - '.github/**'
 
     env:
       CONTAINER_REGISTRY: public.ecr.aws
