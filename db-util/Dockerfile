@@ -1,4 +1,4 @@
-FROM alpine:latest
+FROM public.ecr.aws/moonswitch/alpine-fips:latest
 
 RUN apk add --no-cache postgresql-client
 
